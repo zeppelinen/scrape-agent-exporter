@@ -1,0 +1,159 @@
+version: 2.1
+jobs:
+  build:
+    machine: true
+    steps:
+      - run:
+          name: Convert branch name to lower case
+          command: |
+            echo export CIRCLE_BRANCH=$(echo $CIRCLE_BRANCH | tr '[:upper:]' '[:lower:]') >> $BASH_ENV
+      - restore_cache:
+          keys:
+            - source-{{ .Branch }}-{{ .Revision }}
+            - source-{{ .Branch }}-
+            - source-
+      - checkout
+      - run: docker build --rm=false -t eu.gcr.io/${GCP_PROJECT}/${IMAGE_NAME}-${CIRCLE_BRANCH}:$CIRCLE_SHA1 .
+      - run:
+          name: Save docker image
+          command: |
+            mkdir -p docker-cache
+            docker save -o docker-cache/image.tar eu.gcr.io/${GCP_PROJECT}/${IMAGE_NAME}-${CIRCLE_BRANCH}:$CIRCLE_SHA1
+      - save_cache:
+          key: source-{{ .Branch }}-{{ .Revision }}
+          paths:
+            - .git
+      - save_cache:
+          key: docker-{{ .Branch }}-{{ .Revision }}
+          paths:
+            - docker-cache
+  push:
+    machine: true
+    steps:
+      - restore_cache:
+          keys:
+            - docker-{{ .Branch }}-{{ .Revision }}
+      - run:
+          name: Restore docker image
+          command: |
+            docker load < docker-cache/image.tar
+      - run:
+          name: Docker push
+          command: |
+            echo "Tag docker image"
+            docker tag eu.gcr.io/${GCP_PROJECT}/${IMAGE_NAME}-${CIRCLE_BRANCH}:$CIRCLE_SHA1 eu.gcr.io/${GCP_PROJECT}/${IMAGE_NAME}-${CIRCLE_BRANCH}:$CIRCLE_BUILD_NUM
+            docker tag eu.gcr.io/${GCP_PROJECT}/${IMAGE_NAME}-${CIRCLE_BRANCH}:$CIRCLE_SHA1 eu.gcr.io/${GCP_PROJECT}/${IMAGE_NAME}-${CIRCLE_BRANCH}:latest
+
+            echo "Starting docker push..."
+            echo ${GOOGLE_AUTH} > ${HOME}/gcp-key.json
+            gcloud auth activate-service-account --key-file ${HOME}/gcp-key.json
+            gcloud --quiet config set project ${GCP_PROJECT}
+
+            gcloud docker -- push eu.gcr.io/${GCP_PROJECT}/${IMAGE_NAME}-${CIRCLE_BRANCH}:$CIRCLE_SHA1
+            gcloud docker -- push eu.gcr.io/${GCP_PROJECT}/${IMAGE_NAME}-${CIRCLE_BRANCH}:$CIRCLE_BUILD_NUM
+            gcloud docker -- push eu.gcr.io/${GCP_PROJECT}/${IMAGE_NAME}-${CIRCLE_BRANCH}:latest
+  deploy-dev:
+      machine: true
+      steps:
+        - add_ssh_keys:
+            fingerprints:
+              - "0c:de:87:b0:bd:61:73:0e:28:79:93:52:c5:4d:b8:1d"
+        - run:
+            name: Convert branch name to lower case
+            command: |
+              echo export CIRCLE_BRANCH=$(echo $CIRCLE_BRANCH | tr '[:upper:]' '[:lower:]') >> $BASH_ENV
+        - run:
+            name: Docker-compose up
+            command: |
+              ssh-keyscan ${DEV_HOST} >> ~/.ssh/known_hosts
+              cat ~/.ssh/known_hosts
+              ssh build@${DEV_HOST} \
+              "cd $(dirname $COMPOSE_PATH) && \
+              export COMPOSE_PATH=$COMPOSE_PATH
+              export IMAGE_NAME=$IMAGE_NAME
+              cat $COMPOSE_PATH | yq w - services.${IMAGE_NAME}.image \
+              eu.gcr.io/${GCP_PROJECT}/${IMAGE_NAME}-${CIRCLE_BRANCH}:latest > ${COMPOSE_PATH}_tmp && \
+              mv -vf ${COMPOSE_PATH}_tmp ${COMPOSE_PATH} && \
+              docker-compose -f ${COMPOSE_PATH} pull ${IMAGE_NAME} && \
+              echo Containers running before deploy: && \
+              docker ps && \
+              sleep 7 && \
+              docker-compose -f $COMPOSE_PATH up -d ${IMAGE_NAME} && \
+              sleep 5 && \
+              docker-compose -f $COMPOSE_PATH ps && \
+              echo Containers running after deploy: && \
+              docker ps"
+  ci-test:
+      machine: true
+      steps:
+        - add_ssh_keys:
+            fingerprints:
+              - "0c:de:87:b0:bd:61:73:0e:28:79:93:52:c5:4d:b8:1d"
+        - run:
+            name: Convert branch name to lower case
+            environment:
+              CIRCLE_BRANCH: dev
+            command: |
+              echo export CIRCLE_BRANCH=$(echo $CIRCLE_BRANCH | tr '[:upper:]' '[:lower:]') >> $BASH_ENV
+        - run:
+            name: Docker-compose up
+            environment:
+              CIRCLE_BRANCH: dev
+            command: |
+              ssh-keyscan ${DEV_HOST} >> ~/.ssh/known_hosts
+              cat ~/.ssh/known_hosts
+              ssh build@${DEV_HOST} \
+              "cd $(dirname $COMPOSE_PATH) && \
+              export COMPOSE_PATH=$COMPOSE_PATH
+              export IMAGE_NAME=$IMAGE_NAME
+              cat $COMPOSE_PATH | yq w - services.${IMAGE_NAME}.image \
+              eu.gcr.io/${GCP_PROJECT}/${IMAGE_NAME}-${CIRCLE_BRANCH}:latest > ${COMPOSE_PATH}_tmp && \
+              mv -vf ${COMPOSE_PATH}_tmp ${COMPOSE_PATH} && \
+              docker-compose -f ${COMPOSE_PATH} pull ${IMAGE_NAME} && \
+              echo Containers running before deploy: && \
+              docker ps && \
+              echo Kill all the children && \
+              docker exec \$(docker-compose -f ${COMPOSE_PATH} ps -q ${IMAGE_NAME}) \
+              sleep 7 && \
+              docker-compose -f $COMPOSE_PATH up -d ${IMAGE_NAME} && \
+              sleep 5 && \
+              docker-compose -f $COMPOSE_PATH ps && \
+              echo Containers running after deploy: && \
+              docker ps"
+workflows:
+  version: 2
+  # default development workflow
+  default:
+    jobs:
+      - build:
+          filters:
+            branches:
+              ignore:
+                - ci-test
+      - push:
+          requires:
+            - build
+          filters:
+            branches:
+              only:
+                - master
+                - dev
+                - ci-setup
+                - stage
+      - deploy-dev:
+          requires:
+            - push
+          filters:
+            branches:
+              only:
+                - dev-legacy
+                - ci-setup
+  # Separate workflow to test deployments without full build sequence.
+  # By default uses latest dev image
+  ci-test:
+    jobs:
+      - ci-test:
+          filters:
+            branches:
+              only:
+                - ci-test
